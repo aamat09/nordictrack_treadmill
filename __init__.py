@@ -16,7 +16,14 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up the NordicTrack Treadmill component."""
     hass.data.setdefault(DOMAIN, {})
 
-    # Platform will be automatically loaded from sensor.py
+    # Load sensor platform if domain is in config
+    if DOMAIN in config:
+        hass.async_create_task(
+            hass.helpers.discovery.async_load_platform(
+                Platform.SENSOR, DOMAIN, {}, config
+            )
+        )
+
     _LOGGER.info("NordicTrack Treadmill integration loaded")
     return True
 
