@@ -4,6 +4,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.const import Platform
+from homeassistant.helpers import discovery
 
 from .const import DOMAIN
 
@@ -19,8 +20,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # Load sensor platform if domain is in config
     if DOMAIN in config:
         hass.async_create_task(
-            hass.helpers.discovery.async_load_platform(
-                Platform.SENSOR, DOMAIN, {}, config
+            discovery.async_load_platform(
+                hass, Platform.SENSOR, DOMAIN, {}, config
             )
         )
 
