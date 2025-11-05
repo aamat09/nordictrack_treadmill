@@ -3,8 +3,6 @@ import logging
 import asyncio
 from datetime import timedelta
 
-from homeassistant.components import bluetooth
-from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
 from bleak import BleakClient
 from homeassistant.components.sensor import (
     SensorEntity,
@@ -103,39 +101,15 @@ class TreadmillBLECoordinator:
     async def _async_poll_treadmill(self, now):
         """Poll treadmill for current data."""
         try:
-            # Find treadmill using Home Assistant bluetooth
+            # Use configured MAC address directly
             if not self._treadmill_address:
-                _LOGGER.debug("Scanning for treadmill...")
+                self._treadmill_address = TREADMILL_MAC
+                _LOGGER.info("Using treadmill MAC: %s", self._treadmill_address)
 
-                # Use Home Assistant's bluetooth discovery
-                scanner = bluetooth.async_scanner_by_source(self.hass, bluetooth.MONOTONIC_TIME)
-                if scanner:
-                    # Get all discovered devices
-                    discovered = bluetooth.async_discovered_service_info(self.hass)
-                    for service_info in discovered:
-                        if service_info.name == TREADMILL_NAME:
-                            self._treadmill_address = service_info.address
-                            _LOGGER.info("Found treadmill at %s", self._treadmill_address)
-                            break
-
-                if not self._treadmill_address:
-                    _LOGGER.debug("Treadmill not found, will retry next interval")
-                    self._update_sensor_availability(False)
-                    return
-
-            # Connect and read data using Home Assistant bluetooth
+            # Connect directly to treadmill via BLE
             _LOGGER.debug("Connecting to treadmill at %s...", self._treadmill_address)
-            ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, self._treadmill_address, connectable=True
-            )
 
-            if not ble_device:
-                _LOGGER.warning("BLE device not available")
-                self._treadmill_address = None
-                self._update_sensor_availability(False)
-                return
-
-            async with BleakClient(ble_device, timeout=15.0) as client:
+            async with BleakClient(self._treadmill_address, timeout=15.0) as client:
                 if not client.is_connected:
                     _LOGGER.warning("Failed to connect to treadmill")
                     self._treadmill_address = None  # Reset to force rescan
