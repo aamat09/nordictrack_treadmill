@@ -1,9 +1,9 @@
 """NordicTrack Treadmill sensor platform."""
 import logging
-import asyncio
 from datetime import timedelta
 
-from bleak import BleakClient
+from homeassistant.components import bluetooth
+from homeassistant.components.bluetooth import BluetoothServiceInfoBleak, BluetoothChange
 from homeassistant.components.sensor import (
     SensorEntity,
     SensorDeviceClass,
@@ -18,7 +18,6 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
     DOMAIN,
@@ -35,14 +34,6 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-# BLE Characteristics to read
-CHAR_NOTIFY_1 = "00001535-1412-efde-1523-785feabcd123"  # Main data
-CHAR_READ_1 = "00001534-1412-efde-1523-785feabcd123"    # Backup data
-
-# Polling intervals
-POLL_INTERVAL_ACTIVE = timedelta(seconds=30)  # When changes detected
-POLL_INTERVAL_IDLE = timedelta(minutes=5)     # When no changes
 
 
 async def async_setup_platform(
@@ -73,7 +64,7 @@ async def async_setup_platform(
 
 
 class TreadmillBLECoordinator:
-    """Coordinator to actively poll treadmill via BLE."""
+    """Coordinator to listen for treadmill BLE advertisements via ESPHome proxy."""
 
     def __init__(self, hass: HomeAssistant, sensors: list):
         """Initialize the coordinator."""
@@ -81,95 +72,65 @@ class TreadmillBLECoordinator:
         self.sensors = {sensor.sensor_type: sensor for sensor in sensors}
         self._cancel_callback = None
         self._previous_values = {}
-        self._current_interval = POLL_INTERVAL_ACTIVE
-        self._treadmill_address = None
 
     async def async_start(self):
-        """Start active polling of treadmill."""
-        _LOGGER.info("Starting active BLE polling for treadmill")
+        """Start listening for BLE advertisements."""
+        _LOGGER.info("Starting BLE advertisement listener for treadmill")
 
-        # Do first poll immediately
-        await self._async_poll_treadmill(None)
+        @callback
+        def _async_bluetooth_callback(
+            service_info: BluetoothServiceInfoBleak,
+            change: BluetoothChange,
+        ) -> None:
+            """Handle bluetooth advertisements from ESP proxy."""
 
-        # Schedule periodic polling
-        self._cancel_callback = async_track_time_interval(
+            # Check if this is our treadmill
+            if service_info.name != TREADMILL_NAME:
+                return
+
+            _LOGGER.debug(
+                "BLE advertisement: %s - %s - RSSI: %s",
+                service_info.name,
+                service_info.address,
+                service_info.rssi,
+            )
+
+            # Mark sensors as available
+            self._update_sensor_availability(True)
+
+            # Check for service data
+            if service_info.service_data:
+                for uuid, data in service_info.service_data.items():
+                    _LOGGER.debug("Service data from %s: %s", uuid, data.hex())
+                    self._parse_and_update(data)
+
+            # Check for manufacturer data
+            if service_info.manufacturer_data:
+                for manufacturer_id, data in service_info.manufacturer_data.items():
+                    _LOGGER.debug("Manufacturer data %s: %s", manufacturer_id, data.hex())
+                    self._parse_and_update(data)
+
+        # Register BLE callback for advertisements
+        self._cancel_callback = bluetooth.async_register_callback(
             self.hass,
-            self._async_poll_treadmill,
-            self._current_interval,
+            _async_bluetooth_callback,
+            bluetooth.BluetoothCallbackMatcher(
+                address=None,  # Listen to all, filter by name in callback
+                connectable=False,
+            ),
+            bluetooth.BluetoothScanningMode.ACTIVE,
         )
 
-    async def _async_poll_treadmill(self, now):
-        """Poll treadmill for current data."""
-        try:
-            # Use configured MAC address directly
-            if not self._treadmill_address:
-                self._treadmill_address = TREADMILL_MAC
-                _LOGGER.info("Using treadmill MAC: %s", self._treadmill_address)
+        _LOGGER.info("BLE listener registered for treadmill advertisements")
 
-            # Connect directly to treadmill via BLE
-            _LOGGER.debug("Connecting to treadmill at %s...", self._treadmill_address)
-
-            async with BleakClient(self._treadmill_address, timeout=15.0) as client:
-                if not client.is_connected:
-                    _LOGGER.warning("Failed to connect to treadmill")
-                    self._treadmill_address = None  # Reset to force rescan
-                    self._update_sensor_availability(False)
-                    return
-
-                _LOGGER.debug("Connected! Reading characteristics...")
-
-                # Read main characteristic
-                data = await client.read_gatt_char(CHAR_NOTIFY_1)
-
-                # Parse and check for changes
-                changes_detected = self._parse_and_update(data)
-
-                # Adjust polling interval based on changes
-                new_interval = POLL_INTERVAL_ACTIVE if changes_detected else POLL_INTERVAL_IDLE
-
-                if new_interval != self._current_interval:
-                    self._current_interval = new_interval
-                    _LOGGER.info(
-                        "Adjusting poll interval to %s (changes: %s)",
-                        "30 seconds" if changes_detected else "5 minutes",
-                        changes_detected
-                    )
-
-                    # Reschedule with new interval
-                    if self._cancel_callback:
-                        self._cancel_callback()
-                    self._cancel_callback = async_track_time_interval(
-                        self.hass,
-                        self._async_poll_treadmill,
-                        self._current_interval,
-                    )
-
-                self._update_sensor_availability(True)
-
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Timeout connecting to treadmill")
-            self._treadmill_address = None
-            self._update_sensor_availability(False)
-        except Exception as e:
-            _LOGGER.error("Error polling treadmill: %s", e, exc_info=True)
-            self._treadmill_address = None
-            self._update_sensor_availability(False)
-
-    def _parse_and_update(self, data: bytes) -> bool:
-        """Parse treadmill data and update sensors. Returns True if changes detected."""
+    def _parse_and_update(self, data: bytes):
+        """Parse treadmill advertisement data and update sensors."""
 
         if len(data) < 2:
-            return False
+            return
 
-        changes_detected = False
         hex_data = data.hex()
-
-        # Check if data changed from previous
-        if hex_data != self._previous_values.get("raw_data"):
-            changes_detected = True
-            _LOGGER.info("Data changed: %s", hex_data)
-
-        self._previous_values["raw_data"] = hex_data
+        _LOGGER.debug("Parsing data: %s (%d bytes)", hex_data, len(data))
 
         msg_type = data[0]
         msg_subtype = data[1] if len(data) > 1 else 0
@@ -182,8 +143,7 @@ class TreadmillBLECoordinator:
                 speed = speed_raw / 10.0
                 if 0 <= speed <= 20:  # Sanity check
                     if self._previous_values.get(SENSOR_SPEED) != speed:
-                        changes_detected = True
-                        _LOGGER.info("Speed changed: %.1f mph", speed)
+                        _LOGGER.info("Speed updated: %.1f mph", speed)
                     self._previous_values[SENSOR_SPEED] = speed
                     self.sensors[SENSOR_SPEED].update_value(speed)
 
@@ -193,19 +153,16 @@ class TreadmillBLECoordinator:
                 incline = incline_raw / 10.0
                 if 0 <= incline <= 15:  # Sanity check
                     if self._previous_values.get(SENSOR_INCLINE) != incline:
-                        changes_detected = True
-                        _LOGGER.info("Incline changed: %.1f%%", incline)
+                        _LOGGER.info("Incline updated: %.1f%%", incline)
                     self._previous_values[SENSOR_INCLINE] = incline
                     self.sensors[SENSOR_INCLINE].update_value(incline)
 
             # Update status
             status = "running" if speed > 0 else "idle"
             if self._previous_values.get(SENSOR_STATUS) != status:
-                changes_detected = True
+                _LOGGER.info("Status updated: %s", status)
             self._previous_values[SENSOR_STATUS] = status
             self.sensors[SENSOR_STATUS].update_value(status)
-
-        return changes_detected
 
     def _update_sensor_availability(self, available: bool):
         """Update availability of all sensors."""
@@ -213,10 +170,10 @@ class TreadmillBLECoordinator:
             sensor.set_available(available)
 
     async def async_stop(self):
-        """Stop polling."""
+        """Stop listening for advertisements."""
         if self._cancel_callback:
             self._cancel_callback()
-        _LOGGER.info("Stopped BLE polling")
+        _LOGGER.info("Stopped BLE listener")
 
 
 class NordicTrackSensor(SensorEntity):
