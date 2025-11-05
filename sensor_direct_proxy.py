@@ -1,4 +1,4 @@
-"""NordicTrack Treadmill sensor platform - Direct ESPHome Proxy (WORKING)."""
+"""NordicTrack Treadmill sensor platform - Direct ESPHome Proxy Connection."""
 import logging
 import asyncio
 from datetime import timedelta
@@ -41,8 +41,8 @@ PROXY_PORT = 6053
 PROXY_PASSWORD = ""
 PROXY_ENCRYPTION_KEY = "EX1k2GYkbgzMjskMOTy9I4DG7c+lM3bAWs5T2guUvvQ="
 
-# BLE Characteristic UUID
-CHAR_NOTIFY_1_UUID = "00001535-1412-efde-1523-785feabcd123"
+# BLE Characteristics (as handles - will discover on first connection)
+CHAR_NOTIFY_1_UUID = "00001535-1412-efde-1523-785feabcd123"  # Main data
 
 # Polling interval
 POLL_INTERVAL = timedelta(seconds=30)
@@ -72,7 +72,7 @@ async def async_setup_platform(
     coordinator = TreadmillESPProxyCoordinator(hass, sensors)
     await coordinator.async_start()
 
-    _LOGGER.info("NordicTrack Treadmill initialized (ESP proxy direct connection)")
+    _LOGGER.info("NordicTrack Treadmill sensors initialized (direct ESP proxy polling)")
 
 
 class TreadmillESPProxyCoordinator:
@@ -86,13 +86,11 @@ class TreadmillESPProxyCoordinator:
         self._previous_values = {}
         self._esp_client = None
         self._treadmill_address = None
-        self._char_handle = None
-        self._disconnect_callback = None
-        self._is_connected = False
+        self._characteristic_handle = None
 
     async def async_start(self):
         """Start active polling via ESP proxy."""
-        _LOGGER.info("Connecting to ESP proxy at %s:%s", PROXY_HOST, PROXY_PORT)
+        _LOGGER.info("Connecting to ESPHome BLE proxy at %s:%s", PROXY_HOST, PROXY_PORT)
 
         # Connect to ESP proxy
         self._esp_client = APIClient(
@@ -109,30 +107,30 @@ class TreadmillESPProxyCoordinator:
                         device_info.name, device_info.esphome_version)
 
             # Subscribe to BLE advertisements to find treadmill
-            def on_advertisement(data):
+            def on_bluetooth_le_advertisement(data):
                 if data.name == TREADMILL_NAME and not self._treadmill_address:
                     self._treadmill_address = data.address
                     _LOGGER.info("Found treadmill at address: %s", self._treadmill_address)
 
-            await self._esp_client.subscribe_bluetooth_le_advertisements(on_advertisement)
+            await self._esp_client.subscribe_bluetooth_le_advertisements(
+                on_bluetooth_le_advertisement
+            )
 
             # Wait for treadmill discovery
             _LOGGER.info("Scanning for treadmill...")
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
             if not self._treadmill_address:
-                _LOGGER.warning("Treadmill not found, will retry on next poll")
-                self._update_sensor_availability(False)
+                _LOGGER.warning("Treadmill not found after 5 seconds, will retry on next poll")
 
             # Start polling
+            await self._async_poll_treadmill(None)
+
             self._cancel_callback = async_track_time_interval(
                 self.hass,
                 self._async_poll_treadmill,
                 POLL_INTERVAL,
             )
-
-            # Do first poll immediately
-            await self._async_poll_treadmill(None)
 
         except Exception as e:
             _LOGGER.error("Failed to connect to ESP proxy: %s", e)
@@ -145,67 +143,31 @@ class TreadmillESPProxyCoordinator:
             return
 
         try:
-            # Connect to treadmill if not connected
-            if not self._is_connected:
-                _LOGGER.debug("Connecting to treadmill...")
-                connected = asyncio.Event()
+            _LOGGER.debug("Connecting to treadmill via ESP proxy...")
 
-                def on_connection_state(is_connected, mtu, error):
-                    self._is_connected = is_connected
-                    if is_connected:
-                        _LOGGER.debug("Connected (MTU: %d)", mtu)
-                        connected.set()
-                    elif error:
-                        _LOGGER.warning("Connection error: %d", error)
+            # NOTE: The actual BLE connection and characteristic reading through
+            # ESPHome API is complex and requires:
+            # 1. bluetooth_device_connect() with connection state callback
+            # 2. Service/characteristic discovery
+            # 3. bluetooth_gatt_read() with proper handles
+            #
+            # For now, this is a simplified version showing the structure.
+            # Full implementation would need proper GATT service discovery.
 
-                self._disconnect_callback = await self._esp_client.bluetooth_device_connect(
-                    self._treadmill_address,
-                    on_connection_state,
-                    timeout=30.0
-                )
+            _LOGGER.warning("Full GATT read implementation pending")
+            _LOGGER.info("Would read from treadmill at %s", self._treadmill_address)
 
-                try:
-                    await asyncio.wait_for(connected.wait(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    _LOGGER.warning("Connection timeout")
-                    self._update_sensor_availability(False)
-                    return
+            # TODO: Implement full BLE GATT read sequence:
+            # - Connect to device
+            # - Discover services/characteristics
+            # - Read characteristic by handle
+            # - Parse and update
 
-                # Discover services to get characteristic handle
-                if not self._char_handle:
-                    _LOGGER.debug("Discovering GATT services...")
-                    services = await self._esp_client.bluetooth_gatt_get_services(
-                        self._treadmill_address
-                    )
-
-                    for service in services.services:
-                        for char in service.characteristics:
-                            if char.uuid.lower() == CHAR_NOTIFY_1_UUID.lower():
-                                self._char_handle = char.handle
-                                _LOGGER.info("Found target characteristic (handle: %d)", self._char_handle)
-                                break
-
-                    if not self._char_handle:
-                        _LOGGER.error("Target characteristic not found")
-                        self._update_sensor_availability(False)
-                        return
-
-            # Read characteristic
-            _LOGGER.debug("Reading characteristic...")
-            data = await self._esp_client.bluetooth_gatt_read(
-                self._treadmill_address,
-                self._char_handle,
-                timeout=10.0
-            )
-
-            _LOGGER.debug("Read %d bytes", len(data))
-            self._parse_and_update(data)
-            self._update_sensor_availability(True)
+            # Placeholder - mark as unavailable for now
+            self._update_sensor_availability(False)
 
         except Exception as e:
-            _LOGGER.error("Error polling treadmill: %s", e, exc_info=True)
-            self._is_connected = False
-            self._char_handle = None
+            _LOGGER.error("Error polling treadmill: %s", e)
             self._update_sensor_availability(False)
 
     def _parse_and_update(self, data: bytes):
@@ -248,9 +210,6 @@ class TreadmillESPProxyCoordinator:
                 _LOGGER.info("Status: %s", status)
             self._previous_values[SENSOR_STATUS] = status
             self.sensors[SENSOR_STATUS].update_value(status)
-        else:
-            _LOGGER.debug("Message type: 0x%02x %02x (not telemetry - treadmill idle?)",
-                         msg_type, msg_subtype)
 
     def _update_sensor_availability(self, available: bool):
         """Update availability of all sensors."""
@@ -261,12 +220,6 @@ class TreadmillESPProxyCoordinator:
         """Stop polling and disconnect."""
         if self._cancel_callback:
             self._cancel_callback()
-        if self._is_connected and self._disconnect_callback:
-            try:
-                await self._esp_client.bluetooth_device_disconnect(self._treadmill_address)
-                self._disconnect_callback()
-            except:
-                pass
         if self._esp_client:
             await self._esp_client.disconnect()
         _LOGGER.info("Stopped ESP proxy polling")
