@@ -114,7 +114,8 @@ class TreadmillESPProxyCoordinator:
                     self._treadmill_address = data.address
                     _LOGGER.info("Found treadmill at address: %s", self._treadmill_address)
 
-            await self._esp_client.subscribe_bluetooth_le_advertisements(on_advertisement)
+            # This returns a callback (unsub function), don't await it
+            self._esp_client.subscribe_bluetooth_le_advertisements(on_advertisement)
 
             # Wait for treadmill discovery
             _LOGGER.info("Scanning for treadmill...")
